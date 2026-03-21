@@ -27,8 +27,28 @@ function rewriteRelativePaths(html, pugFile) {
     );
 }
 
+function routeToTitle(route) {
+  return route
+    .split("-")
+    .map((w) => w[0].toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+function getPages() {
+  return globSync("src/pages/*/index.pug", { cwd: __dirname })
+    .sort()
+    .map((pugFile) => {
+      const route = pugToRoute(pugFile);
+      return { route, title: routeToTitle(route), href: `/${route}/` };
+    });
+}
+
 function compilePug(file) {
-  const html = pug.renderFile(file, { basedir: srcDir, filename: file });
+  const html = pug.renderFile(file, {
+    basedir: srcDir,
+    filename: file,
+    pages: getPages(),
+  });
   return rewriteRelativePaths(html, file);
 }
 

@@ -8,8 +8,15 @@ html(lang="en")
     link(rel="stylesheet" href="/src/style.css")
     block head
   body
-    nav
+    button.nav-toggle(popovertarget="nav-drawer" aria-label="Open navigation")
+      span
+      span
+      span
+
+    nav#nav-drawer(popover)
       a(href="/") Home
+      each page in pages
+        a(href=page.href)= page.title
 
     main
       block content
