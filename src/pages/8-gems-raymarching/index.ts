@@ -2,6 +2,7 @@ import * as THREE from "three/webgpu";
 import {
   Fn,
   uniform,
+  uniformArray,
   vec4,
   vec3,
   vec2,
@@ -112,15 +113,51 @@ function generateGemPoints(
   return points;
 }
 
+// Extract one plane per unique face of a ConvexGeometry as { normal, d } pairs
+// where the plane equation is: dot(normal, x) + d = 0
+// Points satisfying dot(normal, x) + d <= 0 are on the interior side.
+function extractFacePlanes(geometry: THREE.BufferGeometry): {
+  normals: THREE.Vector3[];
+  ds: number[];
+} {
+  const posAttr = geometry.attributes.position as THREE.BufferAttribute;
+  const normAttr = geometry.attributes.normal as THREE.BufferAttribute;
+  const triCount = posAttr.count / 3;
+
+  // ConvexGeometry gives the same normal to every vertex on a planar face,
+  // so grouping by normal key deduplicates to one entry per face.
+  const seen = new Map<string, { normal: THREE.Vector3; d: number }>();
+  for (let t = 0; t < triCount; t++) {
+    const i0 = t * 3;
+    const nx = normAttr.getX(i0),
+      ny = normAttr.getY(i0),
+      nz = normAttr.getZ(i0);
+    const key = `${nx.toFixed(4)},${ny.toFixed(4)},${nz.toFixed(4)}`;
+    if (!seen.has(key)) {
+      const n = new THREE.Vector3(nx, ny, nz).normalize();
+      const p = new THREE.Vector3(
+        posAttr.getX(i0),
+        posAttr.getY(i0),
+        posAttr.getZ(i0),
+      );
+      // d = -dot(n, p)  so that dot(n, p) + d = 0 on the face plane
+      seen.set(key, { normal: n, d: -n.dot(p) });
+    }
+  }
+
+  const planes = [...seen.values()];
+  return { normals: planes.map((p) => p.normal), ds: planes.map((p) => p.d) };
+}
+
 const options = {
-  seed: 64,
-  points: 64,
-  topPole: 1,
-  bottomPole: -0.6,
-  equatorBias: 1.5,
-  equatorRadius: 1.0,
-  radialVariance: 0.4,
-  yJitter: 0.1,
+  seed: 3695,
+  points: 128,
+  topPole: 0.83,
+  bottomPole: -1.3,
+  equatorBias: 1.15,
+  equatorRadius: 0.7,
+  radialVariance: 0,
+  yJitter: 1,
   // Exterior
   hueSpeed: 0.1,
   fresnelPower: 2.0,
@@ -132,6 +169,8 @@ const options = {
   interiorStepSize: 0.03,
   interiorNoiseScale: 0.6,
   interiorBrightness: 1.5,
+  interiorFalloffRadius: 0.6,
+  interiorFalloffPower: 1,
 };
 
 // --- Exterior uniforms ---
@@ -146,6 +185,8 @@ const interiorStepsUniform = uniform(options.interiorSteps);
 const interiorStepSizeUniform = uniform(options.interiorStepSize);
 const interiorNoiseScaleUniform = uniform(options.interiorNoiseScale);
 const interiorBrightnessUniform = uniform(options.interiorBrightness);
+const interiorFalloffRadiusUniform = uniform(options.interiorFalloffRadius);
+const interiorFalloffPowerUniform = uniform(options.interiorFalloffPower);
 
 // --- Exterior material (front faces, matcap) ---
 const exteriorMat = new THREE.MeshBasicMaterial({ side: THREE.FrontSide });
@@ -196,51 +237,97 @@ const interiorMat = new THREE.MeshBasicMaterial({
   depthTest: false,
 });
 
-interiorMat.colorNode = Fn(() => {
-  // Ray from back-face surface toward camera (through the interior)
-  const ro = positionWorld.toVar();
-  const rd = cameraPosition.sub(positionWorld).normalize().toVar();
+// Build the interior colorNode using the face planes of the current gem geometry.
+//
+// The core idea is the convex hull SDF:
+//   For a convex polyhedron defined by N face planes, the signed distance from
+//   any point p to the surface is:
+//
+//     SDF(p) = max over all faces i of ( dot(normal_i, p) + d_i )
+//
+//   Each term is the signed distance to a single plane:
+//     - negative means p is on the interior side of that face
+//     - positive means p has crossed outside that face
+//
+//   The max over all faces gives the "least inside" measurement:
+//     - SDF < 0  → p is inside the gem (every plane test is negative)
+//     - SDF = 0  → p is exactly on the surface
+//     - SDF > 0  → p is outside the gem (at least one face is violated)
+//
+//   For interior points, -SDF is the distance to the nearest face.
+//   This is exact at face centres and a lower bound near edges/corners.
+//
+// faceCount is a JS constant baked into the shader loop; changing it
+// requires a new colorNode and triggers shader recompilation.
+function buildInteriorColorNode(
+  faceNormals: ReturnType<typeof uniformArray>,
+  faceDs: ReturnType<typeof uniformArray>,
+  faceCount: number,
+) {
+  return Fn(() => {
+    // Ray origin = back-face world position; direction = toward camera
+    const ro = positionWorld.toVar();
+    const rd = cameraPosition.sub(positionWorld).normalize().toVar();
 
-  const accumulated = vec3(0).toVar();
-  const t = float(0).toVar();
+    const accumulated = vec3(0).toVar();
+    const t = float(0).toVar();
 
-  Loop({ start: 0, end: interiorStepsUniform }, () => {
-    const pos = ro.add(rd.mul(t));
-    const nt = time.mul(hueSpeedUniform);
+    Loop({ start: 0, end: interiorStepsUniform }, () => {
+      const pos = ro.add(rd.mul(t));
+      const nt = time.mul(hueSpeedUniform);
 
-    // Sample FBM noise at this interior position
-    // const n = simplexFBM(pos.mul(interiorNoiseScaleUniform)).pow(2).toVar();
-    const n = patternFBM(pos.mul(interiorNoiseScaleUniform))
-      .pow(4)
-      .mul(2)
-      .toVar();
+      // --- Convex hull SDF ---
+      // Start at -infinity so the first face distance always wins
+      const sdf = float(-1e6).toVar();
+      Loop(faceCount, ({ i }) => {
+        // Signed distance from pos to face i's plane:
+        //   dot(normal_i, pos) + d_i
+        // Negative = inside this half-space, positive = outside
+        const faceDist = (faceNormals.element(i) as any)
+          .dot(pos)
+          .add(faceDs.element(i));
+        // The SDF is the maximum across all faces — the one closest to violating
+        sdf.assign(sdf.max(faceDist));
+      });
+      // sdf is now negative (inside gem). -sdf = distance to nearest face.
+      // smoothstep maps 0 (surface) → 0 and falloffRadius (deep interior) → 1
+      const falloff = smoothstep(
+        float(0),
+        interiorFalloffRadiusUniform,
+        sdf.negate(),
+      ).pow(interiorFalloffPowerUniform);
 
-    // Rainbow hue from world-space position angle (different axis for variety)
-    const hue = fract(
-      atan(pos.z, pos.x)
-        .div(Math.PI * 2)
-        .add(pos.y.mul(0.3))
-        .add(0.5)
-        .add(nt),
-    );
-    const tau = Math.PI * 2;
-    const col = vec3(
-      sin(hue.mul(tau)).mul(0.5).add(0.5),
-      sin(hue.mul(tau).add(2.094)).mul(0.5).add(0.5),
-      sin(hue.mul(tau).add(4.189)).mul(0.5).add(0.5),
-    );
+      // Density: FBM noise shaped by the surface-distance falloff
+      const n = patternFBM(pos.mul(interiorNoiseScaleUniform))
+        .pow(4)
+        .mul(2)
+        .toVar();
 
-    // Accumulate: noise acts as density
-    accumulated.addAssign(
-      col
-        .mul(n.mul(interiorStepSizeUniform).mul(interiorBrightnessUniform))
-        .mul(float(1).sub(t)),
-    );
-    t.addAssign(interiorStepSizeUniform);
-  });
+      const hue = fract(
+        n
+          .div(Math.PI * 2)
+          .add(pos.y.mul(0.3))
+          .add(0.5)
+          .add(nt),
+      );
+      const tau = Math.PI * 2;
+      const col = vec3(
+        sin(hue.mul(tau)).mul(0.5).add(0.5),
+        sin(hue.mul(tau).add(2.094)).mul(0.5).add(0.5),
+        sin(hue.mul(tau).add(4.189)).mul(0.5).add(0.5),
+      );
 
-  return vec4(accumulated, 1);
-})();
+      accumulated.addAssign(
+        col
+          .mul(n.mul(interiorStepSizeUniform).mul(interiorBrightnessUniform))
+          .mul(falloff),
+      );
+      t.addAssign(interiorStepSizeUniform);
+    });
+
+    return vec4(accumulated, 1);
+  })();
+}
 
 // --- Geometry & meshes ---
 let exteriorMesh: THREE.Mesh | null = null;
@@ -258,6 +345,19 @@ function buildGem() {
     options.yJitter,
   );
   const geometry = new ConvexGeometry(pts);
+
+  // Extract face planes and rebuild the interior shader.
+  // Face count may differ each rebuild, which bakes a new loop bound into the
+  // WGSL and forces a recompile — acceptable given the visual accuracy payoff.
+  const { normals, ds } = extractFacePlanes(geometry);
+  const faceNormals = uniformArray(normals, "vec3");
+  const faceDs = uniformArray(ds, "float");
+  interiorMat.colorNode = buildInteriorColorNode(
+    faceNormals,
+    faceDs,
+    normals.length,
+  );
+  interiorMat.needsUpdate = true;
 
   if (exteriorMesh) {
     exteriorMesh.geometry.dispose();
@@ -428,6 +528,26 @@ interiorFolder
   })
   .on("change", (v: any) => {
     interiorBrightnessUniform.value = v.value;
+  });
+interiorFolder
+  .addBinding(options, "interiorFalloffRadius", {
+    label: "Falloff Radius",
+    min: 0.1,
+    max: 2.0,
+    step: 0.01,
+  })
+  .on("change", (v: any) => {
+    interiorFalloffRadiusUniform.value = v.value;
+  });
+interiorFolder
+  .addBinding(options, "interiorFalloffPower", {
+    label: "Falloff Power",
+    min: 0.1,
+    max: 6.0,
+    step: 0.01,
+  })
+  .on("change", (v: any) => {
+    interiorFalloffPowerUniform.value = v.value;
   });
 
 function animate() {
