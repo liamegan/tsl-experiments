@@ -4,12 +4,17 @@ import {
   uniform,
   vec4,
   vec3,
+  vec2,
   normalView,
   positionWorld,
+  positionLocal,
   sin,
   fract,
   atan,
   time,
+  uv,
+  transformedNormalView,
+  normalFlat,
 } from "three/tsl";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { ConvexGeometry } from "three/addons/geometries/ConvexGeometry.js";
@@ -118,11 +123,23 @@ const options = {
   noiseStrength: 0.08,
 };
 
+const topPoleUniform = uniform(options.topPole);
+const bottomPoleUniform = uniform(options.bottomPole);
 const noiseScaleUniform = uniform(options.noiseScale);
 const noiseStrengthUniform = uniform(options.noiseStrength);
 const hueSpeedUniform = uniform(options.hueSpeed);
 const fresnelPowerUniform = uniform(options.fresnelPower);
 const specPowerUniform = uniform(options.specPower);
+
+// Cylindrical UV: u = angle around Y axis, v = normalised height between poles
+const gemUV = Fn(() => {
+  const u = atan(positionLocal.z, positionLocal.x)
+    .div(Math.PI * 2)
+    .add(0.5);
+  const span = topPoleUniform.sub(bottomPoleUniform);
+  const v = positionLocal.y.sub(bottomPoleUniform).div(span);
+  return vec2(u, v);
+});
 
 const material = new THREE.MeshBasicMaterial();
 
@@ -139,6 +156,7 @@ material.normalNode = Fn(() => {
 // Dynamic matcap: hue from view-space normal angle, animated over time
 material.colorNode = Fn(() => {
   const n = normalView.normalize().toVar();
+  const p = positionWorld.toVar();
 
   const nt = time.mul(hueSpeedUniform);
 
@@ -149,7 +167,7 @@ material.colorNode = Fn(() => {
   // );
 
   // Angle of the normal in view-space XY > hue [0, 1], animated
-  const angle = atan(n.y, n.x);
+  const angle = atan(n.y, n.x).add(p.y.mul(2));
   const hue = fract(
     angle
       .div(Math.PI * 2)
@@ -173,6 +191,7 @@ material.colorNode = Fn(() => {
   // Sharp specular highlight at face-on center
   const spec = nz.pow(specPowerUniform);
 
+  // return vec4(normalView, 1);
   return vec4(rainbow.mul(fresnel).add(spec), 1);
 })();
 
@@ -190,6 +209,8 @@ function buildGem() {
     options.yJitter,
   );
   const geometry = new ConvexGeometry(pts);
+  topPoleUniform.value = options.topPole;
+  bottomPoleUniform.value = options.bottomPole;
 
   if (mesh) {
     mesh.geometry.dispose();

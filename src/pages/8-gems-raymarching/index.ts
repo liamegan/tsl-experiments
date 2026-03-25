@@ -4,14 +4,17 @@ import {
   uniform,
   vec4,
   vec3,
+  vec2,
   float,
   normalView,
   positionWorld,
   cameraPosition,
+  abs,
   sin,
   fract,
   atan,
   time,
+  smoothstep,
   Loop,
 } from "three/tsl";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -25,9 +28,18 @@ import { makeFBM } from "/src/lib/fbm.tsl";
 console.clear();
 
 const simplexFBM = makeFBM(simplexNoise, {
-  octaves: 3,
-  lacunarity: 3.0,
-  gain: 0.5,
+  octaves: 2,
+  lacunarity: 1.0,
+  gain: 0.8,
+});
+const patternFBM = Fn(([v]: [any]) => {
+  const a = vec3(simplexFBM(v), simplexFBM(v.add(10)), v.z);
+  const b = vec3(
+    simplexFBM(v.add(a.mul(2).add(1))),
+    simplexFBM(v.add(a.mul(2).sub(20))),
+    v.z,
+  );
+  return simplexFBM(v.add(b.mul(2).add(1)));
 });
 
 const scene = new THREE.Scene();
@@ -112,14 +124,14 @@ const options = {
   // Exterior
   hueSpeed: 0.1,
   fresnelPower: 2.0,
-  specPower: 128.0,
+  specPower: 256.0,
   noiseScale: 4,
   noiseStrength: 0.08,
   // Interior
-  interiorSteps: 32,
-  interiorStepSize: 0.04,
-  interiorNoiseScale: 1.4,
-  interiorBrightness: 1.0,
+  interiorSteps: 16,
+  interiorStepSize: 0.03,
+  interiorNoiseScale: 0.6,
+  interiorBrightness: 1.5,
 };
 
 // --- Exterior uniforms ---
@@ -197,7 +209,11 @@ interiorMat.colorNode = Fn(() => {
     const nt = time.mul(hueSpeedUniform);
 
     // Sample FBM noise at this interior position
-    const n = simplexFBM(pos.mul(interiorNoiseScaleUniform)).pow(2).sub(0.1);
+    // const n = simplexFBM(pos.mul(interiorNoiseScaleUniform)).pow(2).toVar();
+    const n = patternFBM(pos.mul(interiorNoiseScaleUniform))
+      .pow(4)
+      .mul(2)
+      .toVar();
 
     // Rainbow hue from world-space position angle (different axis for variety)
     const hue = fract(
